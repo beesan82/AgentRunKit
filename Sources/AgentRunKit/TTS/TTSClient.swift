@@ -83,8 +83,8 @@ public struct TTSClient<P: TTSProvider>: Sendable {
 
     /// Synthesizes the input and returns concatenated audio plus a per-segment manifest; chunk failure throws.
     ///
-    /// Pass a ``TTSStitchPolicy`` to assemble 16-bit PCM segments with boundary-keyed pauses and
-    /// click-safe fades; without one, segments are concatenated raw.
+    /// Pass a ``TTSStitchPolicy`` to assemble 16-bit PCM segments with minimum boundary-quiet budgets
+    /// and join fades; without one, segments are concatenated raw.
     public func generateWithManifest(
         text: String,
         voice: String? = nil,
@@ -166,6 +166,9 @@ public struct TTSClient<P: TTSProvider>: Sendable {
     ) async throws -> TTSBatchResult {
         guard let total = chunks.first?.total else {
             throw TTSError.invalidConfiguration("generate(chunks:) requires at least one chunk")
+        }
+        guard total > 0 else {
+            throw TTSError.invalidConfiguration("generate(chunks:) requires a positive chunk total")
         }
         let indices = chunks.map(\.index)
         guard chunks.allSatisfy({ $0.total == total }),
@@ -273,7 +276,7 @@ private extension TTSClient {
             return TTSConcatenationResult(audio: output.audio, manifest: entries, loudness: output.summary)
         }
 
-        let result = PCMStitcher.stitch(
+        let result = try PCMStitcher.stitch(
             segments: segments.map(\.audio),
             boundaries: segments.map(\.chunk.trailingBoundary),
             policy: policy,

@@ -334,6 +334,35 @@ struct TTSStitchPolicyTests {
         #expect(policy.joinFade == .zero)
         #expect(policy.loudness == nil)
     }
+
+    @Test
+    func decodingRejectsNegativePausesAndZeroTarget() throws {
+        let encoder = JSONEncoder()
+        let decoder = JSONDecoder()
+        let negativeData = try encoder.encode(Duration.seconds(-1))
+        #expect(try decoder.decode(Duration.self, from: negativeData) < .zero)
+
+        let validPolicy = TTSStitchPolicy()
+        let validValue = try decoder.decode(JSONValue.self, from: encoder.encode(validPolicy))
+        let validRoundTrip = try encoder.encode(validValue)
+        #expect(try decoder.decode(TTSStitchPolicy.self, from: validRoundTrip) == validPolicy)
+
+        guard case let .object(validFields) = validValue else {
+            Issue.record("TTSStitchPolicy must encode as a JSON object")
+            return
+        }
+        var negativeFields = validFields
+        negativeFields["sentencePause"] = try decoder.decode(JSONValue.self, from: negativeData)
+        #expect(throws: DecodingError.self) {
+            try decoder.decode(TTSStitchPolicy.self, from: encoder.encode(JSONValue.object(negativeFields)))
+        }
+
+        var zeroTargetFields = validFields
+        zeroTargetFields["targetCharacters"] = .int(0)
+        #expect(throws: DecodingError.self) {
+            try decoder.decode(TTSStitchPolicy.self, from: encoder.encode(JSONValue.object(zeroTargetFields)))
+        }
+    }
 }
 
 struct TTSLoudnessMatchTests {

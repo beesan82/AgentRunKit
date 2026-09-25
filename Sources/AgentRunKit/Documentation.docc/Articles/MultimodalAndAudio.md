@@ -232,10 +232,17 @@ let result = try await tts.generateWithManifest(
 ```
 
 The policy couples two decisions. `targetCharacters` and `preferParagraphBoundaries` steer the chunker
-to fill toward a soft size target and cut on a sentence or, when one is near, a paragraph boundary, so
-each cut lands where the model already placed its own pause. `sentencePause`, `paragraphPause`, and
-`joinFade` then insert silence of the boundary-appropriate length and fade each segment edge into it.
-Within-sentence seams, from an oversized sentence, are joined directly with no pause.
+to fill toward a soft size target and cut on a sentence or, when one is near, a paragraph boundary
+detected in the input text. `sentencePause` and `paragraphPause` are
+minimum boundary-quiet budgets: quiet already present at the chunk edges counts toward the budget, and
+only the deficit is inserted. Every source frame is preserved, including breaths and longer pauses, so a
+boundary that already carries enough quiet gains no extra silence. This deficit accounting intentionally
+replaces always-added pauses.
+Within-sentence seams, from an oversized sentence, are joined directly with no pause. At any internal
+join, each edge receives the full `joinFade` beside a positive quiet budget and at most 1 ms at a direct
+join, unless that edge's endpoint frame is already quiet. Fades never touch the outer program
+start or end and always leave at least one source frame untouched; a zero
+`joinFade` remains a real no-op.
 
 The manifest stays truthful: each ``TTSSegmentTiming/byteRangeInConcatenatedAudio`` still covers that
 segment's audio, inserted pauses are the gaps between consecutive ranges, and `durationSeconds`

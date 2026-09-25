@@ -17,7 +17,9 @@ enum TTSLoudnessMatcher {
         loudness: TTSLoudnessMatch,
         format: PCMFormat
     ) throws -> Output {
+        precondition(segments.count == boundaries.count, "segments and boundaries must be aligned")
         let sampleRate = format.sampleRate
+        let layouts = try resolveLayouts(segments: segments, boundaries: boundaries, policy: policy, format: format)
         let chunks = segments.map { decode($0) }
         let readings = chunks.map { TTSLoudnessMeter.integratedLoudness($0, sampleRate: sampleRate) }
 
@@ -29,7 +31,7 @@ enum TTSLoudnessMatcher {
         }
 
         let gained = zip(chunks, differentials).map { scaled($0.0, byDB: $0.1) }
-        let (program, sampleRanges) = assemble(gained, boundaries: boundaries, policy: policy, sampleRate: sampleRate)
+        let (program, byteRanges) = try assemble(gained, layouts: layouts)
 
         var assembled = program
         var targetShift = 0.0
@@ -63,10 +65,25 @@ enum TTSLoudnessMatcher {
         )
         return Output(
             audio: encode(assembled),
-            ranges: sampleRanges.map { ($0.lowerBound * 2) ..< ($0.upperBound * 2) },
+            ranges: byteRanges,
             measurements: measurements,
             summary: summary
         )
+    }
+
+    private static func resolveLayouts(
+        segments: [Data],
+        boundaries: [TTSBoundary],
+        policy: TTSStitchPolicy,
+        format: PCMFormat
+    ) throws -> [PCMSeam.Layout] {
+        var planner = try PCMSeam.Planner(format: format, policy: policy, totalSegments: segments.count)
+        var layouts: [PCMSeam.Layout] = []
+        layouts.reserveCapacity(segments.count)
+        for index in segments.indices {
+            try layouts.append(planner.next(audio: segments[index], trailingBoundary: boundaries[index]))
+        }
+        return layouts
     }
 
     private static func summarize(
@@ -110,49 +127,36 @@ enum TTSLoudnessMatcher {
 
     private static func assemble(
         _ chunks: [[Double]],
-        boundaries: [TTSBoundary],
-        policy: TTSStitchPolicy,
-        sampleRate: Int
-    ) -> (program: [Double], ranges: [Range<Int>]) {
-        let sentence = PCMSeam.frameCount(policy.sentencePause, sampleRate: sampleRate)
-        let paragraph = PCMSeam.frameCount(policy.paragraphPause, sampleRate: sampleRate)
-        let fadeFrames = PCMSeam.frameCount(policy.joinFade, sampleRate: sampleRate)
+        layouts: [PCMSeam.Layout]
+    ) throws -> (program: [Double], ranges: [Range<Int>]) {
         var program: [Double] = []
         var ranges: [Range<Int>] = []
         ranges.reserveCapacity(chunks.count)
-        for index in chunks.indices {
-            let trailingPause = PCMSeam.pauseFrames(for: boundaries[index], sentence: sentence, paragraph: paragraph)
-            let leadingPause = index > 0
-                ? PCMSeam.pauseFrames(for: boundaries[index - 1], sentence: sentence, paragraph: paragraph)
-                : 0
-            var chunk = chunks[index]
-            if fadeFrames > 0 {
-                applyEdgeFades(&chunk, fadeIn: leadingPause > 0, fadeOut: trailingPause > 0, fadeFrames: fadeFrames)
+        for (chunk, layout) in zip(chunks, layouts) {
+            guard chunk.count == layout.frameCount else {
+                throw TTSError.invalidConfiguration("loudness matching requires mono (1-channel) 16-bit PCM")
             }
-            let lower = program.count
-            program.append(contentsOf: chunk)
-            ranges.append(lower ..< program.count)
-            if trailingPause > 0 {
-                program.append(contentsOf: repeatElement(0.0, count: trailingPause))
+            var body = chunk
+            if layout.fadeInFrames > 0 || layout.fadeOutFrames > 0 {
+                applyEdgeFades(&body, fadeIn: layout.fadeInFrames, fadeOut: layout.fadeOutFrames)
             }
+            program.append(contentsOf: repeatElement(0.0, count: layout.leadingSilenceFrames))
+            program.append(contentsOf: body)
+            ranges.append(layout.byteRange)
         }
         return (program, ranges)
     }
 
-    private static func applyEdgeFades(_ samples: inout [Double], fadeIn: Bool, fadeOut: Bool, fadeFrames: Int) {
-        guard fadeIn || fadeOut, !samples.isEmpty else { return }
-        let total = samples.count
-        let available = (fadeIn && fadeOut) ? total / 2 : total
-        let fade = min(fadeFrames, available)
-        guard fade > 0 else { return }
-        if fadeIn {
-            for step in 0 ..< fade {
-                samples[step] *= PCMSeam.fadeGain(step: step, fade: fade)
+    private static func applyEdgeFades(_ samples: inout [Double], fadeIn: Int, fadeOut: Int) {
+        guard fadeIn > 0 || fadeOut > 0, !samples.isEmpty else { return }
+        if fadeIn > 0 {
+            for step in 0 ..< fadeIn {
+                samples[step] *= PCMSeam.fadeGain(step: step, fade: fadeIn)
             }
         }
-        if fadeOut {
-            for offset in 0 ..< fade {
-                samples[total - 1 - offset] *= PCMSeam.fadeGain(step: offset, fade: fade)
+        if fadeOut > 0 {
+            for offset in 0 ..< fadeOut {
+                samples[samples.count - 1 - offset] *= PCMSeam.fadeGain(step: offset, fade: fadeOut)
             }
         }
     }

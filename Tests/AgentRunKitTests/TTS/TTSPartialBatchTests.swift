@@ -99,6 +99,29 @@ struct TTSPartialBatchTests {
     }
 
     @Test
+    func generateChunksRejectsNonPositiveTotalsWithoutProviderCalls() async {
+        let provider = MockTTSProvider(config: wavConfig())
+        let client = TTSClient(provider: provider)
+        for total in [-1, 0] {
+            do {
+                _ = try await client.generate(chunks: [
+                    TTSChunk(index: 0, total: total, text: "t0", sourceRange: 0 ..< 2),
+                ])
+                Issue.record("expected TTSError.invalidConfiguration for total \(total)")
+            } catch let error as TTSError {
+                guard case .invalidConfiguration = error else {
+                    Issue.record("expected TTSError.invalidConfiguration, got \(error)")
+                    return
+                }
+            } catch {
+                Issue.record("expected TTSError, got \(error)")
+                return
+            }
+            #expect(await provider.getCallCount() == 0)
+        }
+    }
+
+    @Test
     func rawConcatRecoveryReproducesAnUninterruptedRun() async throws {
         let golden = try await TTSClient(provider: MockTTSProvider(config: wavConfig()))
             .generateWithManifest(text: sixSentences)

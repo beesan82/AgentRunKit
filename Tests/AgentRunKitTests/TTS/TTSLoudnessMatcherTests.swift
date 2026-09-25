@@ -21,6 +21,16 @@ private func pcmTone(amplitude: Double, seconds: Double, freq: Double = 1000) ->
     return data
 }
 
+private func pcmConstant(sample: Int16, frames: Int) -> Data {
+    var data = Data(capacity: frames * 2)
+    let bits = UInt16(bitPattern: sample)
+    for _ in 0 ..< frames {
+        data.append(UInt8(bits & 0x00FF))
+        data.append(UInt8(bits >> 8))
+    }
+    return data
+}
+
 private func boundaries(_ count: Int) -> [TTSBoundary] {
     (0 ..< count).map { $0 == count - 1 ? .end : .sentence }
 }
@@ -49,6 +59,11 @@ private func decodePCM(_ data: Data) -> [Double] {
     return stride(from: 0, to: bytes.count, by: 2).map { index in
         Double(Int16(bitPattern: UInt16(bytes[index]) | (UInt16(bytes[index + 1]) << 8))) / 32768.0
     }
+}
+
+private func sample(_ data: Data, frame: Int) -> Int16 {
+    let index = data.startIndex + frame * 2
+    return Int16(bitPattern: UInt16(data[index]) | (UInt16(data[index + 1]) << 8))
 }
 
 struct TTSLoudnessMatcherTests {
@@ -164,9 +179,65 @@ struct TTSLoudnessMatcherTests {
         let segments = [pcmTone(amplitude: 0.5, seconds: 1), pcmTone(amplitude: 0.3, seconds: 1)]
         let policy = TTSStitchPolicy(sentencePause: .milliseconds(80))
         let output = try match(segments, TTSLoudnessMatch(), boundaries: [.sentence, .end], policy: policy)
-        let pauseBytes = PCMSeam.frameCount(.milliseconds(80), sampleRate: 24000) * 2
+        let pauseBytes = try PCMSeam.frameCount(.milliseconds(80), sampleRate: 24000) * 2
         #expect(output.ranges[0] == 0 ..< 24000 * 2)
         #expect(output.ranges[1].lowerBound == output.ranges[0].upperBound + pauseBytes)
         #expect(output.audio.count == output.ranges[1].upperBound)
+    }
+
+    @Test
+    func plainAndLoudnessLayoutsAgreeOnGapsAndRanges() throws {
+        let first = pcmConstant(sample: 8000, frames: 12000) + Data(count: 2400 * 2)
+        let second = Data(count: 1200 * 2) + pcmConstant(sample: 8000, frames: 12000)
+        let policy = TTSStitchPolicy(sentencePause: .milliseconds(200))
+        let plain = try PCMStitcher.stitch(
+            segments: [first, second],
+            boundaries: [.sentence, .end],
+            policy: policy,
+            format: pcmFormat
+        )
+        let matched = try match([first, second], TTSLoudnessMatch(), boundaries: [.sentence, .end], policy: policy)
+        #expect(matched.ranges == plain.ranges)
+        #expect(matched.audio.count == plain.audio.count)
+        #expect(matched.ranges[1].lowerBound - matched.ranges[0].upperBound == 2400)
+    }
+
+    @Test
+    func plainAndLoudnessPathsAgreeOnFadedOutput() throws {
+        let first = pcmConstant(sample: 6000, frames: 6000)
+        let second = pcmConstant(sample: -6000, frames: 6000)
+        let policy = TTSStitchPolicy(sentencePause: .milliseconds(200), joinFade: .milliseconds(5))
+        let plain = try PCMStitcher.stitch(
+            segments: [first, second], boundaries: [.sentence, .end], policy: policy, format: pcmFormat
+        )
+        let matched = try match([first, second], TTSLoudnessMatch(), boundaries: [.sentence, .end], policy: policy)
+
+        #expect(matched.ranges == plain.ranges)
+        #expect(matched.audio.count == plain.audio.count)
+        #expect(matched.measurements.allSatisfy { $0.appliedGainDB == 0 })
+        #expect(matched.ranges[1].lowerBound - matched.ranges[0].upperBound == 9600)
+
+        let plainFirst = plain.audio.subdata(in: plain.ranges[0])
+        let plainSecond = plain.audio.subdata(in: plain.ranges[1])
+        #expect(sample(plainFirst, frame: 5999) == 0)
+        #expect(sample(plainSecond, frame: 0) == 0)
+        let unfadedJump = abs(Int(6000) - Int(-6000))
+        let plainJump = abs(Int(sample(plainFirst, frame: 5999)) - Int(sample(plainSecond, frame: 0)))
+        #expect(plainJump < unfadedJump)
+        let fadeFrames = try PCMSeam.frameCount(.milliseconds(5), sampleRate: 24000)
+        #expect(plainFirst.prefix((6000 - fadeFrames) * 2) == first.prefix((6000 - fadeFrames) * 2))
+        #expect(plainSecond.suffix(from: fadeFrames * 2) == second.suffix(from: fadeFrames * 2))
+
+        let matchedFirst = matched.audio.subdata(in: matched.ranges[0])
+        let matchedSecond = matched.audio.subdata(in: matched.ranges[1])
+        #expect(abs(Int(sample(matchedFirst, frame: 5999))) <= 1)
+        #expect(abs(Int(sample(matchedSecond, frame: 0))) <= 1)
+        for (plainBody, matchedBody) in [(plainFirst, matchedFirst), (plainSecond, matchedSecond)] {
+            #expect(plainBody.count == matchedBody.count)
+            for frame in 0 ..< plainBody.count / 2 {
+                let drift = abs(Int(sample(plainBody, frame: frame)) - Int(sample(matchedBody, frame: frame)))
+                #expect(drift <= 1)
+            }
+        }
     }
 }
