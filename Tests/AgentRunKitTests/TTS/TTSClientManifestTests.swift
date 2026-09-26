@@ -776,4 +776,38 @@ struct TTSClientLoudnessTests {
         }
         #expect(cursor == result.audio.count)
     }
+
+    @Test
+    func loudnessBelow8kHzThrowsBeforeSynthesis() async {
+        let provider = EncodingAwarePCMProvider(sampleRate: 4000, dataFactory: tonePCM(for:))
+        let client = TTSClient(provider: provider)
+        do {
+            _ = try await client.generateWithManifest(
+                text: "First sentence. Second sentence.",
+                stitch: TTSStitchPolicy(loudness: TTSLoudnessMatch())
+            )
+            Issue.record("Expected invalidConfiguration")
+        } catch let error as TTSError {
+            guard case .invalidConfiguration = error else {
+                Issue.record("Expected invalidConfiguration, got \(error)")
+                return
+            }
+        } catch {
+            Issue.record("Expected TTSError, got \(type(of: error)): \(error)")
+        }
+        let calls = await provider.generateCallCount
+        #expect(calls == 0)
+    }
+
+    @Test
+    func plainStitchingBelow8kHzStillRenders() async throws {
+        let provider = EncodingAwarePCMProvider(sampleRate: 4000, dataFactory: tonePCM(for:))
+        let client = TTSClient(provider: provider)
+        let result = try await client.generateWithManifest(
+            text: "First sentence. Second sentence.",
+            stitch: TTSStitchPolicy(sentencePause: .milliseconds(80))
+        )
+        #expect(!result.audio.isEmpty)
+        #expect(result.loudness == nil)
+    }
 }

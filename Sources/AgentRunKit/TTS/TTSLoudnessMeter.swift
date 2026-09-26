@@ -148,6 +148,13 @@ enum TTSLoudnessMeter {
         return longest - 1
     }()
 
+    static let truePeakQuantizationMargin: Double = {
+        let worstPhase = reversedInterpolatorPhases.map { phase in
+            phase.reduce(0) { $0 + abs($1) }
+        }.max() ?? 1
+        return 0.5 / 32768 * max(1, worstPhase)
+    }()
+
     private static let workBlockLength = 4096
 }
 

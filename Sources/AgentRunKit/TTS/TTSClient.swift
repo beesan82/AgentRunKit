@@ -473,8 +473,8 @@ private extension TTSClient {
                 "stitching requires 16-bit PCM output with a known sample rate and channel count"
             )
         }
-        if loudness, format.channels != 1 {
-            throw TTSError.invalidConfiguration("loudness matching requires mono (1-channel) 16-bit PCM")
+        if loudness {
+            try TTSLoudnessMatcher.validate(format: format)
         }
         return format
     }

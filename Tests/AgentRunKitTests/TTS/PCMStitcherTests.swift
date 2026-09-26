@@ -339,4 +339,84 @@ struct PCMStitcherTests {
             try stitch(segments, boundaries, policy)
         }
     }
+
+    @Test
+    func longFadeStaysContinuousAcrossBlockBoundaries() throws {
+        let level: Int16 = 8000
+        let segments = [pcmFrames(10000, sample: level), pcmFrames(10000, sample: level)]
+        let boundaries: [TTSBoundary] = [.sentence, .end]
+        let policy = TTSStitchPolicy(sentencePause: .milliseconds(200), joinFade: .milliseconds(200))
+        let result = try stitch(segments, boundaries, policy, format: stitchFormat)
+
+        let fade = 4800
+        #expect(result.ranges[1].lowerBound - result.ranges[0].upperBound == 9600)
+        let head = result.audio.subdata(in: result.ranges[0])
+        let tail = result.audio.subdata(in: result.ranges[1])
+        #expect(sample(head, frame: 100) == level)
+        #expect(sample(head, frame: 5199) == level)
+        for frame in [5200, 8191, 8192, 9999] {
+            let expected = Int16((Double(level) * smoothstep(step: 9999 - frame, fade: fade)).rounded())
+            #expect(sample(head, frame: frame) == expected)
+        }
+        for frame in [0, 4095, 4096, 4799] {
+            let expected = Int16((Double(level) * smoothstep(step: frame, fade: fade)).rounded())
+            #expect(sample(tail, frame: frame) == expected)
+        }
+        #expect(sample(tail, frame: 4800) == level)
+    }
+
+    @Test
+    func blockViewsCoverSmallStereoFrames() throws {
+        let oneFrame = stereoFrames(1, left: 1000, right: -1000)
+        var seen: [(Int, Int)] = []
+        try PCMStitcher.forEachSampleBlock(in: oneFrame, format: stereoFormat) { block, offset in
+            seen.append((block.count, offset))
+            #expect(Array(block) == [Double(1000) / 32768.0, Double(-1000) / 32768.0])
+        }
+        #expect(seen.count == 1)
+        #expect(seen[0].0 == 2)
+        #expect(seen[0].1 == 0)
+
+        let layout = PCMSeam.Layout(
+            frameCount: 1,
+            leadingSilenceFrames: 2,
+            fadeInFrames: 0,
+            fadeOutFrames: 0,
+            byteRange: 0 ..< 4
+        )
+        var rendered: [Double] = []
+        try PCMStitcher.forEachRenderedBlock(in: oneFrame, layout: layout, gain: 1, format: stereoFormat) { block in
+            rendered.append(contentsOf: block)
+        }
+        #expect(rendered == [0, 0, 0, 0, Double(1000) / 32768.0, Double(-1000) / 32768.0])
+
+        let data = try PCMStitcher.render(audio: oneFrame, layout: layout, gain: 1, format: stereoFormat)
+        #expect(data.count == 12)
+        #expect(data.prefix(8).allSatisfy { $0 == 0 })
+        #expect(data.suffix(4) == oneFrame)
+    }
+
+    @Test
+    func stitchMatchesConcatenatedPerChunkRenders() throws {
+        let segments = [pcmFrames(5000, sample: 7000), pcmFrames(5000, sample: -7000)]
+        let boundaries: [TTSBoundary] = [.sentence, .end]
+        let policy = TTSStitchPolicy(sentencePause: .milliseconds(80), joinFade: .milliseconds(6))
+        let stitched = try stitch(segments, boundaries, policy)
+
+        var planner = try PCMSeam.Planner(format: stitchFormat, policy: policy, totalSegments: segments.count)
+        var rendered = Data()
+        var ranges: [Range<Int>] = []
+        for index in segments.indices {
+            let layout = try planner.next(audio: segments[index], trailingBoundary: boundaries[index])
+            try rendered.append(PCMStitcher.render(
+                audio: segments[index],
+                layout: layout,
+                gain: 1,
+                format: stitchFormat
+            ))
+            ranges.append(layout.byteRange)
+        }
+        #expect(rendered == stitched.audio)
+        #expect(ranges == stitched.ranges)
+    }
 }

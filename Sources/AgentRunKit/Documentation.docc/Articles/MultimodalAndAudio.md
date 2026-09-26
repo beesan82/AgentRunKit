@@ -278,8 +278,10 @@ median, and applies one scalar gain per chunk bounded by `maxCorrectionDB`. A si
 corrects the per-draw offset while leaving the chunk's own dynamics intact, and the clamp keeps every
 correction small enough that a genuinely soft chunk is never forced up to match a loud one. A
 true-peak guard then attenuates the whole program if its oversampled true peak would exceed
-`truePeakCeilingDBTP`. All correction happens in floating point and is quantized to 16-bit once, so no
-intermediate stage clips.
+`truePeakCeilingDBTP`. All correction happens in floating point over bounded sample scratch. The
+retained input and output bytes, per-chunk readings, gains, layouts, and scalar gating statistics
+grow with program length; only the waveform scratch is bounded. The program is quantized to 16-bit
+PCM once with saturation, so no intermediate stage clips or rounds to integers.
 
 ``TTSLoudnessMatch/target`` selects the anchor. `.programMedian` levels the chunks to each other and
 imposes no absolute level. `.lufs(_:)` additionally shifts the whole program to an absolute loudness,
@@ -291,21 +293,28 @@ true-peak ceiling forces the program below an absolute target the shortfall is r
 
 Loudness matching populates the manifest with its own measurements. Each ``TTSManifestEntry/loudness``
 carries the segment's measured loudness and the gain applied, and ``TTSConcatenationResult/loudness``
-carries the program-level outcome, so the correction is auditable from the result alone. The pass
-requires mono 16-bit PCM and runs only through
-``TTSClient/generateWithManifest(text:voice:options:stitch:)``; streaming cannot match loudness because
+carries the program-level outcome, so the correction is auditable from the result alone. Those
+program figures describe the delivered bytes: ``TTSLoudnessSummary/achievedLUFS`` and
+``TTSLoudnessSummary/truePeakDBTP`` are measured from the returned PCM, and the peak ceiling
+reserves headroom for the worst-case quantization error of the oversampling filter. A ceiling with no
+representable headroom throws ``TTSError/invalidConfiguration(_:)`` instead of clipping, as does an
+absolute target with no measurable delivered output. The pass
+requires mono 16-bit PCM at 8 kHz or above and runs through
+``TTSClient/generateWithManifest(text:voice:options:stitch:)`` or ``TTSClient/stitch(segments:policy:)``; streaming cannot match loudness because
 it has no lookahead over chunks not yet synthesized. The default ceiling is the EBU R128 production
 value of -1 dBTP.
 
 ### Recovering from Partial Failure
 
-``TTSClient/stream(text:voice:options:)``, ``TTSClient/generateAll(text:voice:options:)``, and
+``TTSClient/stream(text:voice:options:)`` yields each chunk in order as results arrive, so segments
+already delivered stand when a later chunk fails; the failure still ends the stream with an error.
+``TTSClient/generateAll(text:voice:options:)`` and
 ``TTSClient/generateWithManifest(text:voice:options:stitch:)`` are all-or-nothing: one chunk's failure
-throws and discards the segments that already succeeded. For long inputs, where re-running the whole
+throws and the completed segments are not returned. For long inputs, where re-running the whole
 batch re-bills the good chunks, use ``TTSClient/generateBatch(text:voice:options:stitch:)``. It returns
 a ``TTSBatchResult`` that preserves every completed ``TTSSegment`` and reports each failed chunk as a
-``TTSChunkFailure`` keyed by chunk index rather than completion order; only empty text and invalid
-configuration throw.
+``TTSChunkFailure`` keyed by chunk index rather than completion order. Empty text and invalid
+configuration throw before any synthesis, while cancellation still escapes as `CancellationError`.
 
 Recover by re-running just the failed chunks, merging, then assembling:
 
