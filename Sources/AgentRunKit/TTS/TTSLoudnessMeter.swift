@@ -143,17 +143,14 @@ enum TTSLoudnessMeter {
 
     private static let reversedInterpolatorPhases = interpolatorPhases.map { Array($0.reversed()) }
 
-    private static let truePeakHistoryLength: Int = {
-        let longest = interpolatorPhases.map(\.count).max() ?? 1
-        return longest - 1
-    }()
-
-    static let truePeakQuantizationMargin: Double = {
+    private static let interpolationGainBound: Double = {
         let worstPhase = reversedInterpolatorPhases.map { phase in
             phase.reduce(0) { $0 + abs($1) }
         }.max() ?? 1
-        return 0.5 / 32768 * max(1, worstPhase)
+        return max(1, worstPhase)
     }()
+
+    static let truePeakQuantizationMargin: Double = 0.5 / 32768 * interpolationGainBound
 
     private static let workBlockLength = 4096
 }
@@ -273,6 +270,11 @@ extension TTSLoudnessMeter {
 
 extension TTSLoudnessMeter {
     struct TruePeakState {
+        static let historySampleCount: Int = {
+            let longest = TTSLoudnessMeter.interpolatorPhases.map(\.count).max() ?? 1
+            return longest - 1
+        }()
+
         private var history: [Double] = []
         private var sampleCount = 0
         private var peak = 0.0
@@ -281,7 +283,7 @@ extension TTSLoudnessMeter {
 
         init() {
             windowWork = WorkBuffer(
-                capacity: TTSLoudnessMeter.truePeakHistoryLength + TTSLoudnessMeter.workBlockLength
+                capacity: Self.historySampleCount + TTSLoudnessMeter.workBlockLength
             )
             stageWork = WorkBuffer(capacity: TTSLoudnessMeter.workBlockLength)
         }
@@ -302,6 +304,116 @@ extension TTSLoudnessMeter {
             return measured > 0 ? 20 * log10(measured) : -.infinity
         }
 
+        func maximumGain(
+            followingHead: UnsafeBufferPointer<Double>,
+            isolatedPeak: Double,
+            leadingSilenceFrames: Int,
+            ceilingDBTP: Double,
+            quantizationStep: Double,
+            requestedGain: Double
+        ) throws -> Double {
+            precondition(followingHead.count <= Self.historySampleCount, "head must fit the interpolator history")
+            precondition(isolatedPeak.isFinite && isolatedPeak >= 0, "isolated peak must be finite and non-negative")
+            precondition(leadingSilenceFrames >= 0, "leading silence must not be negative")
+            precondition(quantizationStep.isFinite && quantizationStep > 0, "step must be finite and positive")
+            precondition(requestedGain.isFinite && requestedGain > 0, "requested gain must be finite and positive")
+            let ceilingLinear = pow(10.0, ceilingDBTP / 20.0)
+            let margin = 0.5 * quantizationStep * TTSLoudnessMeter.interpolationGainBound
+            guard ceilingLinear > margin else {
+                throw TTSError.invalidConfiguration("true-peak ceiling leaves no representable quantization headroom")
+            }
+            let cap = min(requestedGain, isolatedPeak > 0 ? (ceilingLinear - margin) / isolatedPeak : .infinity)
+            guard leadingSilenceFrames < Self.historySampleCount else { return cap }
+            // Every candidate is a region top, so a feasible region keeps the whole body's largest quantized samples.
+            var candidate = cap
+            while true {
+                try Task.checkCancellation()
+                let quantized = Self.quantizedHead(at: candidate, followingHead: followingHead, step: quantizationStep)
+                if 20 * log10(mixedJoinPeak(quantizedHead: quantized, silence: leadingSilenceFrames)) <= ceilingDBTP {
+                    return candidate
+                }
+                let bottom = Self.smallestGain(
+                    reachingMagnitudes: quantized.map(abs),
+                    followingHead: followingHead,
+                    step: quantizationStep,
+                    top: candidate
+                )
+                candidate = bottom.nextDown
+                guard candidate > 0 else { break }
+            }
+            throw TTSError.invalidConfiguration("no positive gain holds the join under truePeakCeilingDBTP")
+        }
+
+        private static func quantizedHead(
+            at gain: Double, followingHead: UnsafeBufferPointer<Double>, step: Double
+        ) -> [Double] {
+            var quantized = [Double](repeating: 0, count: followingHead.count)
+            for index in 0 ..< followingHead.count where followingHead[index] != 0 {
+                // Exactly zero samples round to zero at every gain and carry no signal to preserve.
+                let scaled = (followingHead[index] * gain / step).rounded()
+                quantized[index] = scaled * step
+            }
+            return quantized
+        }
+
+        private func mixedJoinPeak(quantizedHead: [Double], silence: Int) -> Double {
+            let historyLength = Self.historySampleCount
+            let window = windowWork.base
+            var cursor = 0
+            for _ in 0 ..< (historyLength - history.count) {
+                window[cursor] = 0
+                cursor += 1
+            }
+            for sample in history {
+                window[cursor] = sample
+                cursor += 1
+            }
+            for _ in 0 ..< silence {
+                window[cursor] = 0
+                cursor += 1
+            }
+            for sample in quantizedHead {
+                window[cursor] = sample
+                cursor += 1
+            }
+            while cursor < 2 * historyLength {
+                window[cursor] = 0
+                cursor += 1
+            }
+            var peak = 0.0
+            for phase in TTSLoudnessMeter.reversedInterpolatorPhases {
+                TTSLoudnessMeter.convolve(
+                    source: window,
+                    filter: phase,
+                    count: historyLength,
+                    destination: stageWork.base
+                )
+                peak = max(peak, TTSLoudnessMeter.maximumMagnitude(source: stageWork.base, count: historyLength))
+            }
+            return peak
+        }
+
+        private static func smallestGain(
+            reachingMagnitudes magnitudes: [Double],
+            followingHead: UnsafeBufferPointer<Double>,
+            step: Double,
+            top: Double
+        ) -> Double {
+            var low: UInt64 = 1
+            var high = top.bitPattern
+            while low < high {
+                let middle = low + (high - low) / 2
+                let gain = Double(bitPattern: middle)
+                let quantized = quantizedHead(at: gain, followingHead: followingHead, step: step)
+                if magnitudes.indices.allSatisfy({ abs(quantized[$0]) >= magnitudes[$0] }) {
+                    high = middle
+                } else {
+                    low = middle + 1
+                }
+            }
+            return Double(bitPattern: low)
+        }
+
         private mutating func appendBlock(base: UnsafePointer<Double>, count: Int) {
             let block = UnsafeBufferPointer(start: base, count: count)
             peak = max(peak, TTSLoudnessMeter.maximumMagnitude(source: base, count: count))
@@ -311,7 +423,7 @@ extension TTSLoudnessMeter {
         }
 
         private func committedInterpolationPeak(block: UnsafeBufferPointer<Double>) -> Double {
-            let historyLength = TTSLoudnessMeter.truePeakHistoryLength
+            let historyLength = Self.historySampleCount
             let window = windowWork.base
             var cursor = 0
             for _ in 0 ..< (historyLength - history.count) {
@@ -343,7 +455,7 @@ extension TTSLoudnessMeter {
         }
 
         private func peakWithZeroExtendedTail() -> Double {
-            let historyLength = TTSLoudnessMeter.truePeakHistoryLength
+            let historyLength = Self.historySampleCount
             let input = windowWork.base
             var cursor = 0
             for _ in 0 ..< (historyLength - history.count) {
@@ -376,7 +488,7 @@ extension TTSLoudnessMeter {
         }
 
         private mutating func advanceHistory(block: UnsafeBufferPointer<Double>) {
-            let historyLength = TTSLoudnessMeter.truePeakHistoryLength
+            let historyLength = Self.historySampleCount
             let incoming = Array(block.suffix(historyLength))
             let keep = max(0, historyLength - incoming.count)
             history = Array(history.suffix(keep)) + incoming

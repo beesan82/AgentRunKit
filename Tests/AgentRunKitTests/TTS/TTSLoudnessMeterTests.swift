@@ -54,6 +54,30 @@ private func peakByBlocks(_ samples: [Double], sizes: [Int]) -> Double {
     return state.readingDBTP()
 }
 
+private func maximumIsolatedBound(isolatedPeak: Double) -> Double {
+    (pow(10.0, -6.0 / 20.0) - TTSLoudnessMeter.truePeakQuantizationMargin) / isolatedPeak
+}
+
+private func maximumGain(
+    of state: TTSLoudnessMeter.TruePeakState,
+    head: [Double],
+    isolatedPeak: Double,
+    leadingSilenceFrames: Int,
+    ceilingDBTP: Double = -6,
+    requestedGain: Double = 10
+) throws -> Double {
+    try head.withUnsafeBufferPointer {
+        try state.maximumGain(
+            followingHead: $0,
+            isolatedPeak: isolatedPeak,
+            leadingSilenceFrames: leadingSilenceFrames,
+            ceilingDBTP: ceilingDBTP,
+            quantizationStep: 1.0 / 32768,
+            requestedGain: requestedGain
+        )
+    }
+}
+
 struct TTSLoudnessMeterTests {
     @Test
     func sineMatchesFFmpegValidatedLoudness() throws {
@@ -308,5 +332,178 @@ struct TTSLoudnessMeterTests {
         let expected = single.readingDBTP()
         #expect(abs(peakByBlocks(signal, sizes: Array(repeating: 4096, count: 20)) - expected) < 1e-8)
         #expect(abs(peakByBlocks(signal, sizes: [4095, 4096, 4097, 1, 8191]) - expected) < 1e-8)
+    }
+}
+
+extension TTSLoudnessMeterTests {
+    @Test
+    func maximumGainQueryDoesNotAdvanceTheState() throws {
+        let history = [0.3, -0.3, 0.3, 0.3, -0.3, 0.3, -0.3, -0.3, 0.3, 0.3, -0.3]
+        let head = [-0.3, 0.3, -0.3]
+        var probed = TTSLoudnessMeter.TruePeakState()
+        var control = TTSLoudnessMeter.TruePeakState()
+        history.withUnsafeBufferPointer {
+            probed.append($0)
+            control.append($0)
+        }
+        let first = try maximumGain(of: probed, head: head, isolatedPeak: 0.4, leadingSilenceFrames: 0)
+        let second = try maximumGain(of: probed, head: head, isolatedPeak: 0.4, leadingSilenceFrames: 0)
+        #expect(first == second)
+        #expect(first > 0)
+        let rest = [0.3, -0.3, 0.3, 0.3, 0.3, -0.3, -0.3, 0.3]
+        rest.withUnsafeBufferPointer {
+            probed.append($0)
+            control.append($0)
+        }
+        #expect(probed.readingDBTP() == control.readingDBTP())
+    }
+
+    @Test
+    func maximumGainAccountsForInterveningSilence() throws {
+        let isolatedPeak = pow(10.0, dcEdgeOvershootDBTP / 20.0)
+        let isolatedBound = maximumIsolatedBound(isolatedPeak: isolatedPeak)
+        let history = [Double](repeating: 0.3, count: 11)
+        let flipHead = [Double](repeating: -0.3, count: 11)
+        var state = TTSLoudnessMeter.TruePeakState()
+        history.withUnsafeBufferPointer { state.append($0) }
+        let withSilence = try maximumGain(
+            of: state,
+            head: flipHead,
+            isolatedPeak: isolatedPeak,
+            leadingSilenceFrames: TTSLoudnessMeter.TruePeakState.historySampleCount
+        )
+        #expect(abs(withSilence - isolatedBound) < 1e-12)
+        let acrossSeam = try maximumGain(
+            of: state,
+            head: flipHead,
+            isolatedPeak: isolatedPeak,
+            leadingSilenceFrames: 0
+        )
+        #expect(acrossSeam < isolatedBound - 0.02)
+        let partialSilence = try maximumGain(
+            of: state,
+            head: flipHead,
+            isolatedPeak: isolatedPeak,
+            leadingSilenceFrames: 6
+        )
+        #expect(abs(partialSilence - isolatedBound) < 1e-12)
+        #expect(partialSilence > acrossSeam)
+        let seamlessHead = [Double](repeating: 0.3, count: 11)
+        let seamless = try maximumGain(
+            of: state,
+            head: seamlessHead,
+            isolatedPeak: isolatedPeak,
+            leadingSilenceFrames: 0
+        )
+        #expect(abs(seamless - isolatedBound) < 1e-12)
+        let oscillating = [0.3, -0.3, 0.3, -0.3, 0.3, -0.3, 0.3, -0.3, 0.3, -0.3, 0.3]
+        var mixedState = TTSLoudnessMeter.TruePeakState()
+        oscillating.withUnsafeBufferPointer { mixedState.append($0) }
+        let oscillatingSeam = try maximumGain(
+            of: mixedState,
+            head: flipHead,
+            isolatedPeak: isolatedPeak,
+            leadingSilenceFrames: 0
+        )
+        let oscillatingSilence = try maximumGain(
+            of: mixedState,
+            head: flipHead,
+            isolatedPeak: isolatedPeak,
+            leadingSilenceFrames: 3
+        )
+        #expect(oscillatingSeam < oscillatingSilence)
+        #expect(abs(oscillatingSilence - isolatedBound) < 1e-12)
+    }
+
+    @Test
+    func maximumGainAcceptsShortHeadsAndCountsTheirTails() throws {
+        let impulseBound = maximumIsolatedBound(isolatedPeak: 0.5)
+        let fresh = TTSLoudnessMeter.TruePeakState()
+        let impulse = try maximumGain(of: fresh, head: [0.5], isolatedPeak: 0.5, leadingSilenceFrames: 0)
+        #expect(abs(impulse - impulseBound) < 1e-12)
+        let shortPeak = pow(10.0, stepOnsetPeakDBTP / 20.0) * (0.25 / 0.9)
+        let short = try maximumGain(of: fresh, head: [0.25, 0.25], isolatedPeak: shortPeak, leadingSilenceFrames: 0)
+        #expect(abs(short - maximumIsolatedBound(isolatedPeak: shortPeak)) < 1e-12)
+        let history = [Double](repeating: 0.3, count: 11)
+        var state = TTSLoudnessMeter.TruePeakState()
+        history.withUnsafeBufferPointer { state.append($0) }
+        let constantPeak = pow(10.0, dcEdgeOvershootDBTP / 20.0)
+        let tailBound = maximumIsolatedBound(isolatedPeak: constantPeak)
+        let flipTail = try maximumGain(
+            of: state,
+            head: [-0.3, -0.3, -0.3],
+            isolatedPeak: constantPeak,
+            leadingSilenceFrames: 0
+        )
+        #expect(flipTail < tailBound - 0.02)
+    }
+
+    @Test
+    func maximumGainAppliesTheFullRequestToSilentBodies() throws {
+        var state = TTSLoudnessMeter.TruePeakState()
+        [Double](repeating: 0.3, count: 11).withUnsafeBufferPointer { state.append($0) }
+        let emptyHead = try maximumGain(
+            of: state,
+            head: [],
+            isolatedPeak: 0,
+            leadingSilenceFrames: 4,
+            requestedGain: 1.25
+        )
+        #expect(emptyHead == 1.25)
+        let zeroHead = try maximumGain(
+            of: state,
+            head: [0, 0, 0],
+            isolatedPeak: 0,
+            leadingSilenceFrames: 4,
+            requestedGain: 1.25
+        )
+        #expect(zeroHead == 1.25)
+    }
+
+    @Test
+    func maximumGainRejectsIncompatibleConstraints() {
+        let fresh = TTSLoudnessMeter.TruePeakState()
+        #expect(throws: TTSError.self) {
+            _ = try maximumGain(of: fresh, head: [0.5], isolatedPeak: 0.5, leadingSilenceFrames: 0, ceilingDBTP: -200)
+        }
+        var hot = TTSLoudnessMeter.TruePeakState()
+        [Double](repeating: 0.45, count: 11).withUnsafeBufferPointer { hot.append($0) }
+        #expect(throws: TTSError.self) {
+            _ = try maximumGain(of: hot, head: [], isolatedPeak: 0, leadingSilenceFrames: 0, ceilingDBTP: -6)
+        }
+    }
+
+    @Test
+    func maximumGainHonorsPreCancelledTasks() async throws {
+        let task = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            var state = TTSLoudnessMeter.TruePeakState()
+            [Double](repeating: 0.3, count: 11).withUnsafeBufferPointer { state.append($0) }
+            return try maximumGain(of: state, head: [0.5], isolatedPeak: 0.5, leadingSilenceFrames: 0)
+        }
+        await #expect(throws: CancellationError.self) {
+            try await task.value
+        }
+    }
+
+    @Test
+    func maximumGainTreatsExactlyZeroHeadSamplesAsNoConstraint() throws {
+        let ceilingDBTP = -3.0
+        let ceilingLinear = pow(10.0, ceilingDBTP / 20.0)
+        var probe = TTSLoudnessMeter.TruePeakState()
+        [Double](repeating: 0.63, count: 11).withUnsafeBufferPointer { probe.append($0) }
+        let peakRatio = pow(10.0, probe.readingDBTP() / 20.0) / 0.63
+        let hot = ceilingLinear * (1 - 2e-6) / peakRatio
+        var state = TTSLoudnessMeter.TruePeakState()
+        [Double](repeating: hot, count: 11).withUnsafeBufferPointer { state.append($0) }
+        let gain = try maximumGain(
+            of: state,
+            head: [0, 0, 0],
+            isolatedPeak: 0,
+            leadingSilenceFrames: 0,
+            ceilingDBTP: ceilingDBTP,
+            requestedGain: 1.25
+        )
+        #expect(gain == 1.25)
     }
 }

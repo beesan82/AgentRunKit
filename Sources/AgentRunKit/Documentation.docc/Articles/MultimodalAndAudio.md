@@ -284,12 +284,23 @@ grow with program length; only the waveform scratch is bounded. The program is q
 PCM once with saturation, so no intermediate stage clips or rounds to integers.
 
 ``TTSLoudnessMatch/target`` selects the anchor. `.programMedian` levels the chunks to each other and
-imposes no absolute level. `.lufs(_:)` additionally shifts the whole program to an absolute loudness,
+imposes no absolute level. `.recentMedian` levels each chunk against the latest measurable chunks in
+source order. `.lufs(_:)` additionally shifts the whole program to an absolute loudness,
 for example -16 LUFS for podcast delivery. Because the program is mono, that figure is the one-channel
 file's loudness; a player that renders it as dual-mono stereo reads it about 3 dB louder. When the
 true-peak ceiling forces the program below an absolute target the shortfall is reported, never hidden:
 ``TTSLoudnessSummary/achievedLUFS`` is where the program actually landed and
 ``TTSLoudnessSummary/appliedTrimDB`` is how far the guard pulled it down.
+
+`.recentMedian` is the causal alternative to a program anchor: every chunk is leveled to the robust
+median of the latest five measurable chunk readings in source order, including its own, so the
+correction needs no lookahead beyond the current chunk. Short or silent chunks stay out of that
+history and receive no differential gain. Peak protection is per chunk in this mode, holding each
+chunk and its joins under `truePeakCeilingDBTP`, and the chunk's
+``TTSLoudnessMeasurement/appliedGainDB`` includes that peak attenuation. No uniform trim is applied,
+so ``TTSLoudnessSummary/requestedTargetLUFS`` is nil and ``TTSLoudnessSummary/appliedTrimDB`` is zero
+while ``TTSLoudnessSummary/achievedLUFS`` and ``TTSLoudnessSummary/truePeakDBTP`` still measure the
+delivered bytes.
 
 Loudness matching populates the manifest with its own measurements. Each ``TTSManifestEntry/loudness``
 carries the segment's measured loudness and the gain applied, and ``TTSConcatenationResult/loudness``
@@ -300,8 +311,8 @@ reserves headroom for the worst-case quantization error of the oversampling filt
 representable headroom throws ``TTSError/invalidConfiguration(_:)`` instead of clipping, as does an
 absolute target with no measurable delivered output. The pass
 requires mono 16-bit PCM at 8 kHz or above and runs through
-``TTSClient/generateWithManifest(text:voice:options:stitch:)`` or ``TTSClient/stitch(segments:policy:)``; streaming cannot match loudness because
-it has no lookahead over chunks not yet synthesized. The default ceiling is the EBU R128 production
+``TTSClient/generateWithManifest(text:voice:options:stitch:)`` or ``TTSClient/stitch(segments:policy:)``;
+``TTSClient/stream(text:voice:options:)`` delivers raw chunk audio without stitching or loudness matching. The default ceiling is the EBU R128 production
 value of -1 dBTP.
 
 ### Recovering from Partial Failure

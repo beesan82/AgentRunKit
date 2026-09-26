@@ -25,13 +25,21 @@ enum TTSLoudnessMatcher {
     ) throws -> Output {
         precondition(segments.count == boundaries.count, "segments and boundaries must be aligned")
         try validate(format: format)
+        if case .recentMedian = loudness.target {
+            return try matchRecent(
+                segments: segments,
+                boundaries: boundaries,
+                policy: policy,
+                loudness: loudness,
+                format: format
+            )
+        }
         let layouts = try resolveLayouts(segments: segments, boundaries: boundaries, policy: policy, format: format)
         let readings = try measureOriginals(segments: segments, format: format)
         let anchor = computeAnchor(readings.compactMap(\.lufs))
         let maxCorrection = loudness.maxCorrectionDB
         let differentials = readings.map { reading -> Double in
-            guard let anchor, let value = reading.lufs else { return 0 }
-            return min(maxCorrection, max(-maxCorrection, anchor - value))
+            differential(reading.lufs, anchor: anchor, maxCorrectionDB: maxCorrection)
         }
         let analysis = try analyzeProgram(
             segments: segments,
@@ -98,12 +106,16 @@ enum TTSLoudnessMatcher {
 
     private static func measureOriginals(segments: [Data], format: PCMFormat) throws -> [TTSLoudnessReading] {
         try segments.map { audio in
-            let state = TTSLoudnessMeter.IntegratedState(sampleRate: format.sampleRate)
-            try PCMStitcher.forEachSampleBlock(in: audio, format: format) { block, _ in
-                state.append(UnsafeBufferPointer(block))
-            }
-            return state.reading()
+            try measureOriginal(audio: audio, format: format)
         }
+    }
+
+    static func measureOriginal(audio: Data, format: PCMFormat) throws -> TTSLoudnessReading {
+        let state = TTSLoudnessMeter.IntegratedState(sampleRate: format.sampleRate)
+        try PCMStitcher.forEachSampleBlock(in: audio, format: format) { block, _ in
+            state.append(UnsafeBufferPointer(block))
+        }
+        return state.reading()
     }
 
     private static func analyzeProgram(
@@ -168,7 +180,7 @@ enum TTSLoudnessMatcher {
 
     private static func shift(for target: TTSLoudnessMatch.Target, measured: Double?) throws -> Double {
         switch target {
-        case .programMedian:
+        case .programMedian, .recentMedian:
             return 0
         case let .lufs(value):
             guard let measured else {
@@ -192,11 +204,16 @@ enum TTSLoudnessMatcher {
         return min(0, 20 * log10(ceilingLinear - margin) - peakDBTP)
     }
 
-    private static func linearGain(_ decibels: Double) -> Double {
+    static func linearGain(_ decibels: Double) -> Double {
         decibels == 0 ? 1 : pow(10.0, decibels / 20.0)
     }
 
-    private static func computeAnchor(_ measured: [Double]) -> Double? {
+    static func differential(_ value: Double?, anchor: Double?, maxCorrectionDB: Double) -> Double {
+        guard let anchor, let value else { return 0 }
+        return min(maxCorrectionDB, max(-maxCorrectionDB, anchor - value))
+    }
+
+    static func computeAnchor(_ measured: [Double]) -> Double? {
         guard !measured.isEmpty else { return nil }
         let provisional = median(measured)
         let included = measured.filter { $0 >= provisional - relativeGateLU }

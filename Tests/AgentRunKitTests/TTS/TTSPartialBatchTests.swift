@@ -194,6 +194,49 @@ struct TTSPartialBatchTests {
     }
 
     @Test
+    func recentLoudnessStitchRecoveryReproducesAnUninterruptedRun() async throws {
+        let policy = TTSStitchPolicy(targetCharacters: 15, loudness: TTSLoudnessMatch(target: .recentMedian))
+        let goldenClient = TTSClient(
+            provider: EncodingAwarePCMProvider(maxChunkCharacters: 200, dataFactory: tonePCM(for:))
+        )
+        let golden = try await goldenClient.generateWithManifest(text: sixSentences, stitch: policy)
+
+        let failure = TransportError.httpError(statusCode: 500, body: "fail")
+        let batchClient = TTSClient(provider: EncodingAwarePCMProvider(
+            maxChunkCharacters: 200,
+            responses: [2: .failure(failure)],
+            dataFactory: tonePCM(for:)
+        ))
+        let batch = try await batchClient.generateBatch(text: sixSentences, stitch: policy)
+        #expect(batch.failedIndices == [2])
+
+        let retryClient = TTSClient(
+            provider: EncodingAwarePCMProvider(maxChunkCharacters: 200, dataFactory: tonePCM(for:))
+        )
+        let merged = try await batch.merging(retryClient.generate(chunks: batch.failedChunks))
+        let recovered = try retryClient.stitch(segments: merged.completedSegments, policy: policy)
+
+        #expect(recovered.audio == golden.audio)
+        #expect(recovered.loudness == golden.loudness)
+        #expect(recovered.manifest == golden.manifest)
+    }
+
+    @Test
+    func recentLoudnessStitchAssemblesByChunkIndexRegardlessOfSegmentOrder() async throws {
+        let policy = TTSStitchPolicy(targetCharacters: 15, loudness: TTSLoudnessMatch(target: .recentMedian))
+        let client = TTSClient(
+            provider: EncodingAwarePCMProvider(maxChunkCharacters: 200, dataFactory: tonePCM(for:))
+        )
+        let golden = try await client.generateWithManifest(text: sixSentences, stitch: policy)
+        let batch = try await client.generateBatch(text: sixSentences, stitch: policy)
+        let reversed = try client.stitch(segments: Array(batch.completedSegments.reversed()), policy: policy)
+
+        #expect(reversed.audio == golden.audio)
+        #expect(reversed.loudness == golden.loudness)
+        #expect(reversed.manifest == golden.manifest)
+    }
+
+    @Test
     func generateBatchEmptyTextThrowsEmptyText() async {
         let client = TTSClient(provider: MockTTSProvider(config: wavConfig()))
         await #expect(throws: TTSError.emptyText) {

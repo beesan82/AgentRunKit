@@ -376,7 +376,7 @@ struct TTSLoudnessMatchTests {
 
     @Test
     func codableRoundTripPreservesTargetAndKnobs() throws {
-        for target in [TTSLoudnessMatch.Target.programMedian, .lufs(-16)] {
+        for target in [TTSLoudnessMatch.Target.programMedian, .recentMedian, .lufs(-16)] {
             let match = TTSLoudnessMatch(target: target, maxCorrectionDB: 2, truePeakCeilingDBTP: -2)
             let data = try JSONEncoder().encode(match)
             #expect(try JSONDecoder().decode(TTSLoudnessMatch.self, from: data) == match)
@@ -390,6 +390,9 @@ struct TTSLoudnessMatchTests {
         let median = TTSLoudnessMatch(maxCorrectionDB: 3, truePeakCeilingDBTP: -1)
         #expect(try String(data: encoder.encode(median), encoding: .utf8) ==
             #"{"maxCorrectionDB":3,"target":{"programMedian":{}},"truePeakCeilingDBTP":-1}"#)
+        let recent = TTSLoudnessMatch(target: .recentMedian, maxCorrectionDB: 3, truePeakCeilingDBTP: -1)
+        #expect(try String(data: encoder.encode(recent), encoding: .utf8) ==
+            #"{"maxCorrectionDB":3,"target":{"recentMedian":{}},"truePeakCeilingDBTP":-1}"#)
         let absolute = TTSLoudnessMatch(target: .lufs(-16), maxCorrectionDB: 2, truePeakCeilingDBTP: -2)
         #expect(try String(data: encoder.encode(absolute), encoding: .utf8) ==
             #"{"maxCorrectionDB":2,"target":{"lufs":{"_0":-16}},"truePeakCeilingDBTP":-2}"#)
@@ -452,6 +455,11 @@ struct TTSLoudnessMeasurementTests {
         )
         #expect(try String(data: encoder.encode(summary), encoding: .utf8) ==
             #"{"achievedLUFS":-16.1,"appliedTrimDB":-0.4,"requestedTargetLUFS":-16,"truePeakDBTP":-1}"#)
+        let recent = TTSLoudnessSummary(
+            achievedLUFS: -18.5, requestedTargetLUFS: nil, appliedTrimDB: 0, truePeakDBTP: -2.5
+        )
+        #expect(try String(data: encoder.encode(recent), encoding: .utf8) ==
+            #"{"achievedLUFS":-18.5,"appliedTrimDB":0,"truePeakDBTP":-2.5}"#)
         let bare = TTSLoudnessSummary(
             achievedLUFS: nil, requestedTargetLUFS: nil, appliedTrimDB: 0, truePeakDBTP: nil
         )

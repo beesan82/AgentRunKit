@@ -162,12 +162,12 @@ enum PCMStitcher {
             return
         }
         let sourceFrame = outputFrame - layout.leadingSilenceFrames
-        let envelope = gain * renderedFade(sourceFrame: sourceFrame, layout: layout)
+        let fade = renderedFade(sourceFrame: sourceFrame, layout: layout)
         let base = sourceFrame * format.bytesPerFrame
         for channel in 0 ..< format.channels {
             let low = base + channel * 2
             let sample = Int16(bitPattern: UInt16(bytes[low]) | (UInt16(bytes[low + 1]) << 8))
-            scratch[slot + channel] = Double(sample) / pcmScale * envelope
+            scratch[slot + channel] = Double(sample) / pcmScale * fade * gain
         }
     }
 
