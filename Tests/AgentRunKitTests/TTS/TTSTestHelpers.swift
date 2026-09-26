@@ -171,16 +171,255 @@ func alignedPCMData(for text: String) -> Data {
 
 func tonePCM(for text: String) -> Data {
     let hash = text.utf8.reduce(0) { $0 &+ Int($1) }
-    let amplitude = 0.15 + Double(hash % 5) * 0.05
-    let count = 24000
-    var data = Data(capacity: count * 2)
-    for index in 0 ..< count {
+    return tonePCM(amplitude: 0.15 + Double(hash % 5) * 0.05, frames: 24000)
+}
+
+func tonePCM(amplitude: Double, frames: Int) -> Data {
+    var data = Data(capacity: frames * 2)
+    for index in 0 ..< frames {
         let sample = amplitude * sin(2 * .pi * 1000 * Double(index) / 24000)
         let bits = UInt16(bitPattern: Int16((sample * 32767.0).rounded()))
         data.append(UInt8(bits & 0x00FF))
         data.append(UInt8(bits >> 8))
     }
     return data
+}
+
+enum CoordinationStop: Error, Equatable {
+    case runEndedBeforeStart(index: Int)
+    case endedBeforeCount(received: Int, expected: Int)
+}
+
+actor SegmentCollector {
+    private var segments: [TTSSegment] = []
+    private var waiters: [Int: [CheckedContinuation<Void, any Error>]] = [:]
+    private var finished = false
+    private var failure: (any Error)?
+
+    func append(_ segment: TTSSegment) {
+        segments.append(segment)
+        let pending = waiters.removeValue(forKey: segments.count) ?? []
+        for continuation in pending {
+            continuation.resume()
+        }
+    }
+
+    func finish(failure: (any Error)?) {
+        finished = true
+        self.failure = failure
+        let pending = waiters
+        waiters = [:]
+        for (expected, continuations) in pending {
+            for continuation in continuations {
+                continuation.resume(
+                    throwing: failure ?? CoordinationStop.endedBeforeCount(received: segments.count, expected: expected)
+                )
+            }
+        }
+    }
+
+    func waitForCount(_ count: Int) async throws {
+        try await withCheckedThrowingContinuation { continuation in
+            if segments.count >= count {
+                continuation.resume()
+            } else if finished {
+                continuation.resume(
+                    throwing: failure ?? CoordinationStop.endedBeforeCount(received: segments.count, expected: count)
+                )
+            } else {
+                waiters[count, default: []].append(continuation)
+            }
+        }
+    }
+
+    func recorded() -> [TTSSegment] {
+        segments
+    }
+}
+
+func collectStream(
+    _ stream: AsyncThrowingStream<TTSSegment, Error>,
+    into collector: SegmentCollector,
+    onStreamEnd: @escaping @Sendable () async -> Void = {}
+) -> Task<(any Error)?, Never> {
+    Task {
+        var failure: (any Error)?
+        do {
+            for try await segment in stream {
+                await collector.append(segment)
+            }
+        } catch {
+            failure = error
+        }
+        await onStreamEnd()
+        await collector.finish(failure: failure)
+        return failure
+    }
+}
+
+actor GatedTTSProvider: TTSProvider {
+    struct Call: Hashable {
+        let voice: String
+        let index: Int
+    }
+
+    let config: TTSProviderConfig
+    let sampleRate: Int
+    let channels: Int
+    let bitsPerSample: Int
+    private let dataFactory: @Sendable (String) -> Data
+    private var responses: [Int: Result<Data, any Error>]
+    private let gatedCalls: Set<Call>
+
+    private var started: [Call] = []
+    private var released: Set<Call> = []
+    private var completions: [Call: Bool] = [:]
+    private var runEnded = false
+    private var startWaiters: [Call: [CheckedContinuation<Void, any Error>]] = [:]
+    private var releaseWaiters: [Call: [CheckedContinuation<Void, Never>]] = [:]
+    private var completionWaiters: [Call: [CheckedContinuation<Bool, Never>]] = [:]
+
+    init(
+        sampleRate: Int = 24000,
+        channels: Int = 1,
+        bitsPerSample: Int = 16,
+        maxChunkCharacters: Int = 20,
+        defaultVoice: String = "alloy",
+        gatedCalls: Set<Call> = [],
+        responses: [Int: Result<Data, any Error>] = [:],
+        dataFactory: @Sendable @escaping (String) -> Data = alignedPCMData(for:)
+    ) {
+        config = TTSProviderConfig(
+            maxChunkCharacters: maxChunkCharacters,
+            defaultVoice: defaultVoice,
+            defaultFormat: .pcm
+        )
+        self.sampleRate = sampleRate
+        self.channels = channels
+        self.bitsPerSample = bitsPerSample
+        self.gatedCalls = gatedCalls
+        self.responses = responses
+        self.dataFactory = dataFactory
+    }
+
+    nonisolated func resolvedEncoding(for format: TTSAudioFormat, options _: TTSOptions) -> TTSAudioEncoding {
+        switch format {
+        case .pcm:
+            TTSAudioEncoding(format, sampleRate: sampleRate, channels: channels, bitsPerSample: bitsPerSample)
+        case .mp3, .opus, .aac, .flac, .wav:
+            TTSAudioEncoding(format)
+        }
+    }
+
+    func generate(
+        text: String,
+        voice: String,
+        options _: TTSOptions,
+        context: TTSChunkContext
+    ) async throws -> Data {
+        let call = Call(voice: voice, index: context.chunk.index)
+        started.append(call)
+        resumeAll(&startWaiters[call, default: []])
+        if gatedCalls.contains(call) {
+            // Cancellation opens the gate, but the late response still exercises the receiver's cancellation check.
+            await withTaskCancellationHandler {
+                await withCheckedContinuation { continuation in
+                    if released.contains(call) {
+                        continuation.resume()
+                    } else {
+                        releaseWaiters[call, default: []].append(continuation)
+                    }
+                }
+            } onCancel: {
+                Task { await self.release(call) }
+            }
+        }
+        let wasCancelled = Task.isCancelled
+        completions[call] = wasCancelled
+        resumeAll(&completionWaiters[call, default: []], returning: wasCancelled)
+        if let result = responses[context.chunk.index] {
+            return try result.get()
+        }
+        return dataFactory(text)
+    }
+
+    func awaitStarted(_ call: Call) async throws {
+        try await withCheckedThrowingContinuation { continuation in
+            if started.contains(call) {
+                continuation.resume()
+            } else if runEnded {
+                continuation.resume(throwing: CoordinationStop.runEndedBeforeStart(index: call.index))
+            } else {
+                startWaiters[call, default: []].append(continuation)
+            }
+        }
+    }
+
+    func endRun() {
+        runEnded = true
+        for call in Array(startWaiters.keys) {
+            let pending = startWaiters.removeValue(forKey: call) ?? []
+            for continuation in pending {
+                if started.contains(call) {
+                    continuation.resume()
+                } else {
+                    continuation.resume(throwing: CoordinationStop.runEndedBeforeStart(index: call.index))
+                }
+            }
+        }
+    }
+
+    func awaitCompletion(_ call: Call) async -> Bool {
+        await withCheckedContinuation { continuation in
+            if let wasCancelled = completions[call] {
+                continuation.resume(returning: wasCancelled)
+            } else {
+                completionWaiters[call, default: []].append(continuation)
+            }
+        }
+    }
+
+    func release(_ call: Call) {
+        released.insert(call)
+        resumeAll(&releaseWaiters[call, default: []])
+    }
+
+    func releaseAll() {
+        for call in gatedCalls {
+            released.insert(call)
+        }
+        for call in Array(releaseWaiters.keys) {
+            resumeAll(&releaseWaiters[call, default: []])
+        }
+    }
+
+    func startedCalls() -> [Call] {
+        started
+    }
+
+    private func resumeAll(_ waiters: inout [CheckedContinuation<Void, Never>]) {
+        let pending = waiters
+        waiters = []
+        for continuation in pending {
+            continuation.resume()
+        }
+    }
+
+    private func resumeAll(_ waiters: inout [CheckedContinuation<Void, any Error>]) {
+        let pending = waiters
+        waiters = []
+        for continuation in pending {
+            continuation.resume()
+        }
+    }
+
+    private func resumeAll(_ waiters: inout [CheckedContinuation<Bool, Never>], returning value: Bool) {
+        let pending = waiters
+        waiters = []
+        for continuation in pending {
+            continuation.resume(returning: value)
+        }
+    }
 }
 
 actor EncodingAwarePCMProvider: TTSProvider {

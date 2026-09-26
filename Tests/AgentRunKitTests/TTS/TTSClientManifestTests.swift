@@ -702,12 +702,71 @@ struct TTSClientStitchTests {
         }
         #expect(cursor == result.audio.count)
     }
+
+    @Test(arguments: [Data(), Data([0x01, 0x02, 0x03])])
+    func processedStreamSurfacesMalformedProviderPCMWithoutLosingEmittedPrefix(badPCM: Data) async throws {
+        let provider = EncodingAwarePCMProvider(
+            maxChunkCharacters: 20,
+            responses: [1: .success(badPCM)],
+            dataFactory: alignedPCMData(for:)
+        )
+        let client = TTSClient(provider: provider, maxConcurrent: 1)
+        let collector = SegmentCollector()
+        let consumer = collectStream(
+            client.stream(
+                text: "First sentence. Second sentence.",
+                stitch: TTSStitchPolicy()
+            ),
+            into: collector
+        )
+
+        var surfaced: (any Error)?
+        do {
+            try await collector.waitForCount(2)
+            Issue.record("expected the malformed chunk to end the stream")
+        } catch {
+            surfaced = error
+        }
+
+        let surfacedError = try #require(surfaced as? TTSError)
+        guard case .invalidConfiguration = surfacedError else {
+            Issue.record("expected invalidConfiguration, got \(surfacedError)")
+            return
+        }
+        let failure = await consumer.value
+        #expect(failure is TTSError)
+        let segments = await collector.recorded()
+        #expect(segments.map(\.index) == [0])
+    }
+}
+
+private func expectStreamConfigurationFailure(
+    _ stream: AsyncThrowingStream<TTSSegment, Error>,
+    sourceLocation: SourceLocation = #_sourceLocation
+) async {
+    do {
+        for try await _ in stream {
+            Issue.record("expected no segment before the configuration failure", sourceLocation: sourceLocation)
+        }
+        Issue.record("expected TTSError.invalidConfiguration, no error thrown", sourceLocation: sourceLocation)
+    } catch let error as TTSError {
+        guard case .invalidConfiguration = error else {
+            Issue.record("expected invalidConfiguration, got \(error)", sourceLocation: sourceLocation)
+            return
+        }
+    } catch {
+        Issue.record("expected TTSError, got \(error)", sourceLocation: sourceLocation)
+    }
 }
 
 struct TTSClientLoudnessTests {
     @Test
     func loudnessMatchingPopulatesManifestAndDoesNotWidenSpread() async throws {
-        let provider = EncodingAwarePCMProvider(maxChunkCharacters: 200, dataFactory: tonePCM(for:))
+        let levels = ["First": 0.20, "Second": 0.30, "Third": 0.25, "Fourth": 0.28]
+        let factory: @Sendable (String) -> Data = { text in
+            tonePCM(amplitude: levels.first { text.hasPrefix($0.key) }?.value ?? 0.2, frames: 24000)
+        }
+        let provider = EncodingAwarePCMProvider(maxChunkCharacters: 200, dataFactory: factory)
         let client = TTSClient(provider: provider)
         let text = "First sentence here. Second one here. Third sentence here. Fourth one here."
         let policy = TTSStitchPolicy(
@@ -716,19 +775,25 @@ struct TTSClientLoudnessTests {
             loudness: TTSLoudnessMatch(maxCorrectionDB: 6)
         )
         let result = try await client.generateWithManifest(text: text, stitch: policy)
+        let format = try #require(PCMFormat(TTSAudioEncoding(.pcm, sampleRate: 24000, channels: 1, bitsPerSample: 16)))
+
+        var originalLUFS: [Double] = []
+        var bodyLUFS: [Double] = []
+        for entry in result.manifest {
+            let range = try #require(entry.timing.byteRangeInConcatenatedAudio)
+            let original = try TTSLoudnessMatcher.measureOriginal(audio: factory(entry.chunk.text), format: format)
+            let body = try TTSLoudnessMatcher.measureOriginal(audio: result.audio.subdata(in: range), format: format)
+            try originalLUFS.append(#require(original.lufs))
+            try bodyLUFS.append(#require(body.lufs))
+        }
+        let originalSpread = try #require(originalLUFS.max()) - (try #require(originalLUFS.min()))
+        let bodySpread = try #require(bodyLUFS.max()) - (try #require(bodyLUFS.min()))
+        #expect(originalSpread > 1.0)
+        #expect(bodySpread < originalSpread)
 
         #expect(result.loudness != nil)
         #expect(result.loudness?.achievedLUFS != nil)
         #expect(result.manifest.allSatisfy { $0.loudness != nil })
-
-        let measured = try result.manifest.map { try #require($0.loudness?.integratedLUFS) }
-        #expect(measured.count >= 2)
-        let corrected = try result.manifest.map { entry in
-            try #require(entry.loudness?.integratedLUFS) + #require(entry.loudness?.appliedGainDB)
-        }
-        let measuredSpread = try #require(measured.max()) - (try #require(measured.min()))
-        let correctedSpread = try #require(corrected.max()) - (try #require(corrected.min()))
-        #expect(correctedSpread <= measuredSpread + 1e-9)
         for entry in result.manifest {
             #expect(try abs(#require(entry.loudness?.appliedGainDB)) <= 6.0 + 1e-9)
         }
@@ -809,5 +874,125 @@ struct TTSClientLoudnessTests {
         )
         #expect(!result.audio.isEmpty)
         #expect(result.loudness == nil)
+    }
+
+    @Test(arguments: [TTSLoudnessMatch.Target.programMedian, .lufs(-16)])
+    func processedStreamRejectsWholeProgramTargetsBeforeAnyProviderCall(target: TTSLoudnessMatch.Target) async throws {
+        let provider = EncodingAwarePCMProvider(dataFactory: alignedPCMData(for:))
+        let client = TTSClient(provider: provider)
+        let policy = TTSStitchPolicy(loudness: TTSLoudnessMatch(target: target))
+        var failure: (any Error)?
+        do {
+            for try await _ in client.stream(text: "First sentence. Second sentence.", stitch: policy) {}
+        } catch {
+            failure = error
+        }
+
+        let error = try #require(failure as? TTSError)
+        guard case .invalidConfiguration = error else {
+            Issue.record("expected invalidConfiguration, got \(error)")
+            return
+        }
+        let calls = await provider.generateCallCount
+        #expect(calls == 0)
+    }
+
+    @Test
+    func processedStreamRejectsUnstitchableOutputBeforeAnyProviderCall() async {
+        let mp3Provider = MockTTSProvider()
+        await expectStreamConfigurationFailure(
+            TTSClient(provider: mp3Provider).stream(text: "First sentence.", stitch: TTSStitchPolicy())
+        )
+        let stereoProvider = EncodingAwarePCMProvider(channels: 2, dataFactory: alignedPCMData(for:))
+        await expectStreamConfigurationFailure(
+            TTSClient(provider: stereoProvider).stream(
+                text: "First sentence.",
+                stitch: TTSStitchPolicy(loudness: TTSLoudnessMatch(target: .recentMedian))
+            )
+        )
+        let lowRateProvider = EncodingAwarePCMProvider(sampleRate: 4000, dataFactory: tonePCM(for:))
+        await expectStreamConfigurationFailure(
+            TTSClient(provider: lowRateProvider).stream(
+                text: "First sentence.",
+                stitch: TTSStitchPolicy(loudness: TTSLoudnessMatch(target: .recentMedian))
+            )
+        )
+        #expect(await mp3Provider.getCallCount() == 0)
+        #expect(await stereoProvider.generateCallCount == 0)
+        #expect(await lowRateProvider.generateCallCount == 0)
+    }
+
+    @Test
+    func concurrentRecentStreamsKeepIndependentHistories() async throws {
+        let levels = [
+            "Alpha one": 0.15, "Alpha two": 0.35, "Alpha three": 0.25, "Alpha four": 0.30,
+            "Beta one": 0.35, "Beta two": 0.15, "Beta three": 0.30, "Beta four": 0.25,
+        ]
+        let alphaText = "Alpha one. Alpha two. Alpha three. Alpha four."
+        let betaText = "Beta one. Beta two. Beta three. Beta four."
+        let provider = GatedTTSProvider(
+            maxChunkCharacters: 20,
+            gatedCalls: Set(
+                (0 ..< 4).flatMap {
+                    [GatedTTSProvider.Call(voice: "alpha", index: $0), GatedTTSProvider.Call(voice: "beta", index: $0)]
+                }
+            ),
+            dataFactory: { text in
+                let amplitude = levels.first { text.hasPrefix($0.key) }?.value ?? 0.2
+                return tonePCM(amplitude: amplitude, frames: 24000)
+            }
+        )
+        let client = TTSClient(provider: provider, maxConcurrent: 4)
+        let policy = TTSStitchPolicy(loudness: TTSLoudnessMatch(target: .recentMedian, maxCorrectionDB: 6))
+        let alphaPlan = client.chunks(for: alphaText, stitch: policy)
+        let betaPlan = client.chunks(for: betaText, stitch: policy)
+        #expect(alphaPlan.count >= 3 && betaPlan.count >= 3)
+        let alphaCollector = SegmentCollector()
+        let betaCollector = SegmentCollector()
+        let alphaConsumer = collectStream(
+            client.stream(text: alphaText, voice: "alpha", stitch: policy),
+            into: alphaCollector
+        ) {
+            await provider.releaseAll()
+            await provider.endRun()
+        }
+        let betaConsumer = collectStream(
+            client.stream(text: betaText, voice: "beta", stitch: policy),
+            into: betaCollector
+        ) {
+            await provider.releaseAll()
+            await provider.endRun()
+        }
+
+        do {
+            for index in 0 ..< max(alphaPlan.count, betaPlan.count) {
+                if index < alphaPlan.count {
+                    await provider.release(GatedTTSProvider.Call(voice: "alpha", index: index))
+                    try await alphaCollector.waitForCount(index + 1)
+                }
+                if index < betaPlan.count {
+                    await provider.release(GatedTTSProvider.Call(voice: "beta", index: index))
+                    try await betaCollector.waitForCount(index + 1)
+                }
+            }
+        } catch {
+            await provider.releaseAll()
+            await provider.endRun()
+            _ = await alphaConsumer.value
+            _ = await betaConsumer.value
+            throw error
+        }
+        #expect(await alphaConsumer.value == nil)
+        #expect(await betaConsumer.value == nil)
+
+        let runs = [(alphaText, "alpha", alphaCollector), (betaText, "beta", betaCollector)]
+        for (text, voice, collector) in runs {
+            let completed = try await client.generateWithManifest(text: text, voice: voice, stitch: policy)
+            var concatenated = Data()
+            for segment in await collector.recorded() {
+                concatenated.append(segment.audio)
+            }
+            #expect(concatenated.elementsEqual(completed.audio))
+        }
     }
 }

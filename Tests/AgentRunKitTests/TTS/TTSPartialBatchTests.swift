@@ -82,6 +82,47 @@ struct TTSPartialBatchTests {
     }
 
     @Test
+    func cancelledConsumerStopsProcessedStreamDelivery() async throws {
+        let calls = (0 ..< 3).map { GatedTTSProvider.Call(voice: "alloy", index: $0) }
+        let provider = GatedTTSProvider(maxChunkCharacters: 15, gatedCalls: Set(calls))
+        let client = TTSClient(provider: provider, maxConcurrent: 1)
+        let collector = SegmentCollector()
+        let consumer = collectStream(
+            client.stream(
+                text: "First sent. Second sent. Third sent.",
+                stitch: TTSStitchPolicy()
+            ),
+            into: collector
+        ) {
+            await provider.releaseAll()
+            await provider.endRun()
+        }
+
+        try await provider.awaitStarted(calls[0])
+        await provider.release(calls[0])
+        do {
+            try await collector.waitForCount(1)
+        } catch {
+            await provider.releaseAll()
+            await provider.endRun()
+            _ = await consumer.value
+            throw error
+        }
+        try await provider.awaitStarted(calls[1])
+        consumer.cancel()
+        if let failure = await consumer.value {
+            #expect(failure is CancellationError)
+        }
+
+        let wasCancelled = await provider.awaitCompletion(calls[1])
+        #expect(wasCancelled)
+        let started = await provider.startedCalls()
+        #expect(started == [calls[0], calls[1]])
+        let segments = await collector.recorded()
+        #expect(segments.map(\.index) == [0])
+    }
+
+    @Test
     func generateChunksReRunsOnlyTheGivenChunks() async throws {
         let failure = TransportError.httpError(statusCode: 500, body: "fail")
         let failingProvider = MockTTSProvider(config: wavConfig(), responses: [2: .failure(failure)])
@@ -237,6 +278,71 @@ struct TTSPartialBatchTests {
     }
 
     @Test
+    func recentStreamMatchesCompletedRecoveryRenderingExactly() async throws {
+        let provider = EncodingAwarePCMProvider(maxChunkCharacters: 20, dataFactory: tonePCM(for:))
+        let client = TTSClient(provider: provider)
+        let text = "First sentence here. Second one here. Third sentence here. Fourth one here."
+        let policy = TTSStitchPolicy(
+            targetCharacters: 18,
+            sentencePause: .milliseconds(120),
+            loudness: TTSLoudnessMatch(target: .recentMedian, maxCorrectionDB: 6)
+        )
+        let batch = try await client.generateBatch(text: text, stitch: policy)
+        #expect(batch.completedSegments.allSatisfy { $0.timing == .uncomputed })
+        let completed = try client.stitch(segments: batch.completedSegments, policy: policy)
+
+        var streamed: [TTSSegment] = []
+        var concatenated = Data()
+        for try await segment in client.stream(text: text, stitch: policy) {
+            streamed.append(segment)
+            concatenated.append(segment.audio)
+        }
+
+        #expect(concatenated.elementsEqual(completed.audio))
+        #expect(streamed.map(\.chunk) == completed.manifest.map(\.chunk))
+        var cursor = 0
+        for (index, segment) in streamed.enumerated() {
+            let entry = completed.manifest[index]
+            #expect(segment.timing == entry.timing)
+            let raw = batch.completedSegments[index].audio
+            let range = try #require(segment.timing.byteRangeInConcatenatedAudio)
+            #expect(range.count == raw.count)
+            #expect(segment.timing.durationSeconds == Double(raw.count) / 48000.0)
+            let gapBytes = segment.audio.count - raw.count
+            #expect(range.lowerBound == cursor + gapBytes)
+            #expect(index == 0 ? gapBytes == 0 : gapBytes > 0)
+            cursor = range.upperBound
+        }
+        #expect(cursor == concatenated.count)
+    }
+
+    @Test
+    func plainStreamMatchesCompletedStitchExactly() async throws {
+        let provider = EncodingAwarePCMProvider(maxChunkCharacters: 20, dataFactory: alignedPCMData(for:))
+        let client = TTSClient(provider: provider)
+        let text = "First sentence here. Second one here. Third sentence here."
+        let policy = TTSStitchPolicy(
+            targetCharacters: 15,
+            sentencePause: .milliseconds(100),
+            joinFade: .milliseconds(6)
+        )
+        let completed = try await client.generateWithManifest(text: text, stitch: policy)
+
+        var streamed: [TTSSegment] = []
+        var concatenated = Data()
+        for try await segment in client.stream(text: text, stitch: policy) {
+            streamed.append(segment)
+            concatenated.append(segment.audio)
+        }
+
+        #expect(concatenated == completed.audio)
+        #expect(streamed.map(\.chunk) == completed.manifest.map(\.chunk))
+        for (segment, entry) in zip(streamed, completed.manifest) {
+            #expect(segment.timing == entry.timing)
+        }
+    }
+
+    @Test
     func generateBatchEmptyTextThrowsEmptyText() async {
         let client = TTSClient(provider: MockTTSProvider(config: wavConfig()))
         await #expect(throws: TTSError.emptyText) {
@@ -338,6 +444,66 @@ struct TTSPartialBatchTests {
         let wav = [segment(index: 0, total: 1, encoding: TTSAudioEncoding(.wav))]
         expectInvalidConfiguration {
             try client.stitch(segments: wav, policy: TTSStitchPolicy(sentencePause: .milliseconds(10)))
+        }
+    }
+}
+
+extension TTSPartialBatchTests {
+    @Test
+    func cancelledProducerDropsUncooperativeResultsAndStopsLaunching() async throws {
+        let calls = (0 ..< 3).map { GatedTTSProvider.Call(voice: "alloy", index: $0) }
+        let provider = GatedTTSProvider(maxChunkCharacters: 15, gatedCalls: Set(calls))
+        let plan = TTSClient(provider: provider).chunks(for: "First sent. Second sent. Third sent.")
+        #expect(plan.count == 3)
+        let (delivered, delivery) = AsyncStream<TTSSegment>.makeStream()
+        let task = Task { () throws in
+            let completion: Result<Void, any Error>
+            do {
+                _ = try await TTSClient<GatedTTSProvider>.runChunks(
+                    plan,
+                    voice: "alloy",
+                    options: TTSOptions(),
+                    encoding: TTSAudioEncoding(.pcm, sampleRate: 24000, channels: 1, bitsPerSample: 16),
+                    provider: provider,
+                    maxConcurrent: 1,
+                    handling: .failFast,
+                    onSegment: { delivery.yield($0) }
+                )
+                completion = .success(())
+            } catch {
+                completion = .failure(error)
+            }
+            await provider.releaseAll()
+            await provider.endRun()
+            delivery.finish()
+            try completion.get()
+        }
+
+        do {
+            try await provider.awaitStarted(calls[0])
+            await provider.release(calls[0])
+            try await provider.awaitStarted(calls[1])
+        } catch {
+            await provider.releaseAll()
+            await provider.endRun()
+            try await task.value
+            throw error
+        }
+        task.cancel()
+        await provider.release(calls[1])
+
+        await #expect(throws: CancellationError.self) {
+            try await task.value
+        }
+        var received: [TTSSegment] = []
+        for await segment in delivered {
+            received.append(segment)
+        }
+        #expect(received.map(\.index) == [0])
+        let started = await provider.startedCalls()
+        #expect(started == [calls[0], calls[1]])
+        await #expect(throws: CoordinationStop.runEndedBeforeStart(index: 2)) {
+            try await provider.awaitStarted(calls[2])
         }
     }
 }
